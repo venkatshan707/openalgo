@@ -73,38 +73,33 @@ Both are in the backtest as options, off by default (`CONFIRM_WINDOW`, `FAST_SWI
   - Its other 31 trades made +Rs 66,713. Drawing the channel earlier but not trading the 4th swing itself may be worth a separate test. That observation was picked out after the fact, so it is not a result.
 - **Verdict:** both raise the trade count but lower quality in 4 to 5 of the 6 periods. Today's rules stay.
 
-## 0d. Experiment results on 2 years of data (2026-11-18)
+## 0d. Experiment results on 2 years of data (corrected 2026-11-23)
 
 Backtest: anchored channels, ITM1, frozen settings, 2024-11-04 to 2026-11-17 (37,751 5m bars).
-Periods P1–P12 are two-month blocks; none of this is out of sample.
+All of this is in-sample, so none of it has been tested on unseen months.
 
-| Experiment | Trades | Win% | Rs | MaxDD | Notes |
+**Correction:** the first run (2026-11-18) left out the lot 1 exit when it added up rupees. Below, every trade includes both lots. The verdict on E2 reverses.
+
+| Experiment | Trades | Win% | Rs | Max drawdown | Lot 1 exits |
 |---|---|---|---|---|---|
-| Base (frozen settings) | 72 | 45.8 | +8,980 | 29,460 | 2-year baseline |
-| E1: Side filter | 47 | 48.9 | **+35,931** | **14,617** | Drops 25 trades, almost 4x the Rs, half the drawdown |
-| E2: Lot 1 at 1.5x risk | 72 | 45.8 | -24,572 | 41,876 | Worse: lot 1 often exits too early at stop-distance, before the move pays |
-| E2: Lot 1 at 2.0x risk | 72 | 45.8 | -13,661 | 37,234 | Still worse than base |
-| E3: Breakout entries | 77 | 45.5 | +11,237 | 27,203 | 5 extra trades, +Rs 2,257; 40% win |
-| E1+E2 (1.5x risk) | 47 | 48.9 | -1,519 | 23,607 | Side filter + risk target: risk target kills the gain |
-| E1+E2+E3 | 52 | 48.1 | +737 | 21,350 | All three: near zero |
+| Base (frozen settings) | 72 | 45.8 | +27,025 | 19,996 | 6 |
+| E1: side filter | 47 | 48.9 | +42,207 | 14,617 | 1 |
+| E2: lot 1 at 1.5x risk | 72 | 45.8 | +29,962 | 19,497 | 17 |
+| E2: lot 1 at 2.0x risk | 72 | 45.8 | +29,702 | 18,628 | 11 |
+| E3: breakout entries | 77 | 45.5 | +29,283 | 18,706 | 6 |
+| E1 + E2 (1.5x risk) | 47 | 48.9 | +42,926 | 13,562 | 13 |
 
-By period (Rs), P1 to P12:
+**What this means:**
 
-| Experiment | P1 | P2 | P3 | P4 | P5 | P6 | P7 | P8 | P9 | P10 | P11 | P12 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Base | +19k | +1.9k | -2.2k | -7.7k | -2.9k | +1.6k | +5.6k | -11k | +10.9k | -14.5k | +7.8k | +2.8k |
-| E1 side filter | +14.9k | +1.9k | +0.3k | -3.2k | -2.9k | +5.5k | +4.7k | -12.2k | +12.4k | -1.4k | +7.8k | +10.4k |
-| E3 breakout | +19k | -3k | +4k | -7.7k | -2.9k | +2.5k | +5.6k | -11k | +10.9k | -14.5k | +7.8k | +2.8k |
-
-Breakout trades (E3): 5 trades, 2 won, +Rs 2,257. 1 EOD exit (+Rs 2,919), 4 trail stops (-Rs 662).
-
-**What this means for each experiment:**
-
-1. **E1 side filter: strong result.** 25 fewer trades but Rs 27k more profit and the drawdown halved. The dropped trades are the wrong-side ones (rising broadening wedge CE — 8 trades, +3 won, -Rs 3.3k; channel_flat, wedges, triangles — net losing). The two big winning patterns (falling broadening wedge PE, channel_up CE) are exactly what Bulkowski recommends. Worth adopting once confirmed on out-of-sample periods.
-
-2. **E2 risk-multiple lot 1: clearly worse.** Replacing the 80% channel target with a 1.5x or 2x risk target loses Rs 33k to 24k versus base. The initial risk (stop distance) is too small relative to where the trade actually travels. The frozen 80%-of-channel target is better calibrated for these patterns than a risk multiple.
-
-3. **E3 breakout entries: too few to judge.** Only 5 trades in 2 years. The two-hour window and the strong-body requirement are very tight. The concept is not disproved but not confirmed either. Needs a looser entry filter or a longer window to generate enough trades for a verdict.
+1. **E1, side filter: the strongest result.**
+   - It makes Rs 15k more with 25 fewer trades, and the drawdown falls by about a quarter.
+   - It drops the sides Bulkowski avoids: against-slope channel trades, narrowing wedges, and triangles.
+   - Rising broadening wedge CE trades are kept, since that is his preferred side.
+   - It still needs a test on unseen months before it becomes the default.
+2. **E2, lot 1 at a multiple of risk: a small gain, not a loss.**
+   - It adds about Rs 3k, slightly lowers the drawdown, and books lot 1 in 11 to 17 trades instead of 6.
+   - The effect is small. Lot 1 at 80% of the channel is frozen, so it stays unless the trader asks.
+3. **E3, breakout entries: too few trades to judge.** Only 5 trades in 2 years, for about +Rs 2k. The entry rule needs loosening before it can be judged.
 
 ## 0c. Gaps compared with common trader practice (review of 2026-11-02, nothing changed)
 

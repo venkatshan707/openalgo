@@ -1140,7 +1140,7 @@ def _simulate(df5, df15, ph15, pl15, cfg, feats=None):
                                     "lot1_done": False, "be_done": False,
                                     "trail": None, "swing": [], "div": False, "confl": False,
                                     "rec": None, "fast": False,
-                                    "lot1_target": c[i] + 1.5 * brk_risk if lot1_risk_mult > 0 else None,
+                                    "lot1_target": c[i] + lot1_risk_mult * brk_risk if lot1_risk_mult > 0 else None,
                                     "brk_target": brk_tgt,
                                 }
                                 day_trades += 1
@@ -1158,7 +1158,7 @@ def _simulate(df5, df15, ph15, pl15, cfg, feats=None):
                                     "lot1_done": False, "be_done": False,
                                     "trail": None, "swing": [], "div": False, "confl": False,
                                     "rec": None, "fast": False,
-                                    "lot1_target": c[i] - 1.5 * brk_risk if lot1_risk_mult > 0 else None,
+                                    "lot1_target": c[i] - lot1_risk_mult * brk_risk if lot1_risk_mult > 0 else None,
                                     "brk_target": brk_tgt,
                                 }
                                 day_trades += 1
