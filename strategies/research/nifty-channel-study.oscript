@@ -1,0 +1,261 @@
+version 1
+
+// Nifty channel strategy, drawn as the backtest trades it.
+// Use on a 5m NIFTY chart: the backtest trades 5m candles, so on any other
+// interval the marks and the tally are a different strategy.
+// Mirrors _simulate() in strategies/research/channel_research.py.
+//
+// One position at a time: after an entry no new signal appears until that trade
+// exits (stop, target or 15:15), so a run of red candles at resistance is one PE,
+// not five. After a stop the strategy waits before entering again.
+//
+// Channel: lines through the last two confirmed 15m swing highs and lows. A swing
+// counts only once `right` later 15m bars have closed, and only closed 15m bars
+// are read, so nothing drawn here uses a candle that had not happened yet.
+
+pivLeft = input(5, "Swing left bars (15m)", min = 2, max = 20)
+pivRight = input(3, "Swing right bars (15m)", min = 1, max = 10)
+parTol = input(0.30, "Parallel tolerance", min = 0.05, max = 3.0)
+proxPct = input(0.4, "Touch proximity %", min = 0.05, max = 2.0)
+bodyMin = input(0.5, "Bounce candle body fraction", min = 0.1, max = 0.95)
+rrMin = input(2.5, "Min reward / risk", min = 0.5, max = 6.0)
+stopFixed = input(15.0, "Stop buffer, min points", min = 1, max = 100)
+stopMult = input(0.3, "Stop buffer, x avg candle range", min = 0.0, max = 3.0)
+zonePct = input(0.8, "Target zone fraction", min = 0.5, max = 0.99)
+maxTrades = input(3, "Max trades per day", min = 1, max = 10)
+cooloffMin = input(30, "Wait after a stop, minutes", min = 0, max = 240)
+window = input("0915-1500", "Entry window")
+halfExit = input(true, "Exit 1 of 2 lots at the centre")
+showFar = input(false, "Draw the channel when price is far from it")
+
+study("Nifty Channel Strategy", overlay = true, precision = 2)
+
+// ---- channel on closed 15m bars ----
+// Each read is one expression evaluated on the 15m bars. A swing is reported on
+// its confirming bar, so the bar index recorded there is the swing's plus `right`.
+// "confirmed" steps one 5m bar after a 15m bar closes. On the 5m bar whose close
+// completes a 15m bar, the "developing" read is that 15m bar in full, so it is
+// used there: the backtest does the same, and neither reads an unfinished bar.
+h1c = req.timeframe("15", valueWhen(not isNone(pivotHigh(high, pivLeft, pivRight)), pivotHigh(high, pivLeft, pivRight), 0))
+h2c = req.timeframe("15", valueWhen(not isNone(pivotHigh(high, pivLeft, pivRight)), pivotHigh(high, pivLeft, pivRight), 1))
+hc1c = req.timeframe("15", valueWhen(not isNone(pivotHigh(high, pivLeft, pivRight)), bar.index, 0))
+hc2c = req.timeframe("15", valueWhen(not isNone(pivotHigh(high, pivLeft, pivRight)), bar.index, 1))
+l1c = req.timeframe("15", valueWhen(not isNone(pivotLow(low, pivLeft, pivRight)), pivotLow(low, pivLeft, pivRight), 0))
+l2c = req.timeframe("15", valueWhen(not isNone(pivotLow(low, pivLeft, pivRight)), pivotLow(low, pivLeft, pivRight), 1))
+lc1c = req.timeframe("15", valueWhen(not isNone(pivotLow(low, pivLeft, pivRight)), bar.index, 0))
+lc2c = req.timeframe("15", valueWhen(not isNone(pivotLow(low, pivLeft, pivRight)), bar.index, 1))
+idxc = req.timeframe("15", bar.index)
+
+h1d = req.timeframe("15", valueWhen(not isNone(pivotHigh(high, pivLeft, pivRight)), pivotHigh(high, pivLeft, pivRight), 0), "developing")
+h2d = req.timeframe("15", valueWhen(not isNone(pivotHigh(high, pivLeft, pivRight)), pivotHigh(high, pivLeft, pivRight), 1), "developing")
+hc1d = req.timeframe("15", valueWhen(not isNone(pivotHigh(high, pivLeft, pivRight)), bar.index, 0), "developing")
+hc2d = req.timeframe("15", valueWhen(not isNone(pivotHigh(high, pivLeft, pivRight)), bar.index, 1), "developing")
+l1d = req.timeframe("15", valueWhen(not isNone(pivotLow(low, pivLeft, pivRight)), pivotLow(low, pivLeft, pivRight), 0), "developing")
+l2d = req.timeframe("15", valueWhen(not isNone(pivotLow(low, pivLeft, pivRight)), pivotLow(low, pivLeft, pivRight), 1), "developing")
+lc1d = req.timeframe("15", valueWhen(not isNone(pivotLow(low, pivLeft, pivRight)), bar.index, 0), "developing")
+lc2d = req.timeframe("15", valueWhen(not isNone(pivotLow(low, pivLeft, pivRight)), bar.index, 1), "developing")
+idxd = req.timeframe("15", bar.index, "developing")
+
+closes15 = (date.minute(time) + chart.intervalMinutes) % 15 == 0
+h1 = closes15 ? h1d : h1c
+h2 = closes15 ? h2d : h2c
+hc1 = closes15 ? hc1d : hc1c
+hc2 = closes15 ? hc2d : hc2c
+l1 = closes15 ? l1d : l1c
+l2 = closes15 ? l2d : l2c
+lc1 = closes15 ? lc1d : lc1c
+lc2 = closes15 ? lc2d : lc2c
+idx15 = closes15 ? idxd : idxc
+
+rawRes = h1 + (h1 - h2) / max(hc1 - hc2, 1) * (idx15 - hc1 + pivRight)
+rawSup = l1 + (l1 - l2) / max(lc1 - lc2, 1) * (idx15 - lc1 + pivRight)
+w0 = abs(h2 - l2)
+wNow = abs(rawRes - rawSup)
+parallel = w0 > 0 and abs(wNow - w0) / w0 <= parTol
+resistance = parallel ? rawRes : none
+support = parallel ? rawSup : none
+centre = (resistance + support) / 2
+width = resistance - support
+chanOk = not isNone(resistance) and not isNone(support)
+
+// A channel projected far from price cannot trade (no touch), so by default it is
+// not drawn: only while price is inside it or within a quarter of its width.
+nearPrice = chanOk and close >= support - 0.25 * width and close <= resistance + 0.25 * width
+drawn = chanOk and (showFar or nearPrice)
+resLine = plot(drawn ? resistance : none, "Resistance", #ef4444, width = 2)
+supLine = plot(drawn ? support : none, "Support", #22c55e, width = 2)
+plot(drawn ? centre : none, "Centre", #64748b)
+fill(resLine, supLine, #64748b, opacity = 0.06)
+
+// ---- position state, the same order of checks as the backtest ----
+avgRange = sma(high - low, 21)
+buf = max(stopFixed, stopMult * orElse(avgRange, 0))
+prox = proxPct / 100
+hhmm = date.hour(time) * 100 + date.minute(time)
+entryOpen = session.isIn(window)
+
+var held = 0
+var entryPx = none
+var stopPx = none
+var lots = 0
+var halfDone = false
+var trail = none
+var sw1 = none
+var sw2 = none
+var swN = 0
+var tradePts = 0.0
+var dayTrades = 0
+var cooloffUntil = 0
+var nTrades = 0
+var nWins = 0
+var totalPts = 0.0
+
+ceEntry = false
+peEntry = false
+exitStop = false
+exitTarget = false
+exitEod = false
+exitHalf = false
+exitPx = none
+closed = false
+booked = false
+
+if session.isFirstBar
+    dayTrades = 0
+    held = 0
+
+if held != 0 and hhmm >= 1515
+    exitEod = true
+    exitPx = close
+    closed = true
+else if held != 0 or entryOpen
+    // stop and trailing stop run on every bar, channel or not
+    if held == 1
+        if close < stopPx
+            exitStop = true
+            exitPx = close
+            closed = true
+        else
+            if close > open
+                sw1 = sw2
+                sw2 = low
+                swN = swN + 1
+            if swN >= 2
+                t = min(sw1, sw2) - buf
+                trail = isNone(trail) ? t : max(trail, t)
+                stopPx = max(stopPx, trail)
+    else if held == -1
+        if close > stopPx
+            exitStop = true
+            exitPx = close
+            closed = true
+        else
+            if close < open
+                sw1 = sw2
+                sw2 = high
+                swN = swN + 1
+            if swN >= 2
+                t = max(sw1, sw2) + buf
+                trail = isNone(trail) ? t : min(trail, t)
+                stopPx = min(stopPx, trail)
+
+    if not closed and chanOk
+        // breakeven, half exit at centre, target in the zone
+        if held == 1
+            if close >= centre and stopPx < entryPx
+                stopPx = entryPx
+            if halfExit and not halfDone and lots >= 2 and close >= centre
+                exitHalf = true
+                tradePts = tradePts + (close - entryPx)
+                lots = lots - 1
+                halfDone = true
+            if close >= support + zonePct * width and close < open
+                exitTarget = true
+                exitPx = close
+                closed = true
+        else if held == -1
+            if close <= centre and stopPx > entryPx
+                stopPx = entryPx
+            if halfExit and not halfDone and lots >= 2 and close <= centre
+                exitHalf = true
+                tradePts = tradePts + (entryPx - close)
+                lots = lots - 1
+                halfDone = true
+            if close <= resistance - zonePct * width and close > open
+                exitTarget = true
+                exitPx = close
+                closed = true
+
+        // a target exit is booked here, so the opposite entry may follow on this bar
+        if exitTarget
+            tradePts = tradePts + held * (exitPx - entryPx) * lots
+            nTrades = nTrades + 1
+            nWins = nWins + (tradePts > 0 ? 1 : 0)
+            totalPts = totalPts + tradePts
+            held = 0
+            booked = true
+
+        // new entry: flat, inside the window, under the daily cap, not cooling off
+        if held == 0 and entryOpen and dayTrades < maxTrades and time >= cooloffUntil
+            rng = high - low
+            body = rng > 0.01 ? (close - open) / rng : none
+            ceTouch = close >= support * (1 - prox) and low[1] <= support * (1 + prox)
+            peTouch = close <= resistance * (1 + prox) and high[1] >= resistance * (1 - prox)
+            if ceTouch
+                strong = not isNone(body) and body >= bodyMin
+                twoUp = close[1] > close[2] and close > close[1] and close > open
+                sp = support - buf
+                if (strong or twoUp) and close - sp > 0 and resistance - close >= rrMin * (close - sp)
+                    ceEntry = true
+                    held = 1
+                    stopPx = sp
+            else if peTouch
+                strong = not isNone(body) and -body >= bodyMin
+                twoDown = close[1] < close[2] and close < close[1] and close < open
+                sp = resistance + buf
+                if (strong or twoDown) and sp - close > 0 and close - support >= rrMin * (sp - close)
+                    peEntry = true
+                    held = -1
+                    stopPx = sp
+            if held != 0
+                entryPx = close
+                lots = 2
+                halfDone = false
+                trail = none
+                swN = 0
+                tradePts = 0.0
+                dayTrades = dayTrades + 1
+
+if closed and not booked
+    tradePts = tradePts + held * (exitPx - entryPx) * lots
+    nTrades = nTrades + 1
+    nWins = nWins + (tradePts > 0 ? 1 : 0)
+    totalPts = totalPts + tradePts
+    if exitStop
+        cooloffUntil = time + cooloffMin * 60000
+    held = 0
+
+// ---- markers ----
+signal(ceEntry ? "CE" : none, color = #22c55e, at = "below", shape = "triangleUp")
+signal(peEntry ? "PE" : none, color = #ef4444, at = "above", shape = "triangleDown")
+signal(exitHalf ? "Half" : none, color = #94a3b8, at = "above", shape = "circle")
+signal(exitTarget ? "Target" : none, color = #84cc16, at = "above", shape = "diamond")
+signal(exitStop ? "Stop" : none, color = #f97316, at = "above", shape = "cross")
+signal(exitEod ? "15:15" : none, color = #a78bfa, at = "above", shape = "square")
+
+plot(held != 0 ? stopPx : none, "Stop", #f97316, style = "step")
+plot(held != 0 ? entryPx : none, "Entry", #e5e7eb, style = "step")
+targetLvl = held == 1 ? support + zonePct * width : held == -1 ? resistance - zonePct * width : none
+plot(targetLvl, "Target zone", #84cc16, style = "step")
+
+// ---- running tally on the loaded bars, in Nifty points (2 lots, before costs) ----
+stats = table("Tally", 4, 2, position = "topRight")
+if bar.isLast
+    cell(stats, 0, 0, "Trades")
+    cell(stats, 0, 1, text(nTrades))
+    cell(stats, 1, 0, "Win rate")
+    cell(stats, 1, 1, nTrades > 0 ? text(100 * nWins / nTrades, 1) + "%" : "-")
+    cell(stats, 2, 0, "Nifty pts")
+    cell(stats, 2, 1, text(totalPts, 1))
+    cell(stats, 3, 0, "Chart")
+    cell(stats, 3, 1, chart.intervalMinutes == 5 ? "5m, as tested" : "Switch to 5m: tested on 5m")

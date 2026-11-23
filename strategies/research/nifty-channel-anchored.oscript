@@ -1,0 +1,583 @@
+version 1
+
+// Nifty anchored channel, drawn and traded as the backtest does it.
+// Use on a 5m NIFTY chart. Mirrors CHANNEL_MODE "anchored" with ENTRY_RULE
+// "two_candle" in strategies/research/channel_research.py.
+//
+// Channel: built from 4 confirmed 15m swings (two highs, two lows) and then held.
+//   Downtrend, near parallel: resistance through H1-H2, support parallel through
+//   the lowest 15m low between them. Uptrend is the mirror.
+//   Both lines sloping the same way but widening or narrowing: both kept as drawn.
+//   Lines sloping opposite ways (a triangle): not a channel.
+// Break: a 15m candle closes beyond a line with a body of half its range or more,
+//   and the next 15m candle opens and closes beyond it too. The next channel is
+//   built from swings formed after the break.
+// Entry, PE (CE mirrors it): 5m candle 1 touches resistance and closes red with a
+//   body of half its range or more; candle 2 closes below candle 1's low.
+// Exit, CE (PE mirrors it): lot 1 on a close 80% of the way up the channel. Lot 2 is sold when a candle
+//   whose high is in the top zone (or above) is a doji, an inverted hammer, or a strong
+//   red candle closing below the open of the last green candle. Once the zone is
+//   reached, each green candle lifts the stop to the middle of its body.
+// Only closed 15m candles and confirmed swings are used.
+
+pivLeft = input(5, "Swing left bars (15m)", min = 2, max = 20)
+// frozen by the trader (2026-11-02): swing confirmation, entry window, lot 1 exit
+pivRight = 3  // also written as the literal 3 in the 15m swing reads below
+parTol = input(0.30, "Parallel tolerance", min = 0.05, max = 3.0)
+minWidth = input(2.0, "Min channel width, x avg 5m range", min = 0.5, max = 20)
+breakBody = input(0.5, "Break candle body fraction", min = 0.1, max = 0.95)
+touchFrac = input(0.10, "Touch band, fraction of width", min = 0.01, max = 0.5)
+bodyMin = input(0.30, "Rejection candle body fraction", min = 0.1, max = 0.95)
+rrMin = input(1.5, "Min reward / risk", min = 0.5, max = 6.0)
+stopFixed = input(15.0, "Stop buffer, min points", min = 1, max = 100)
+stopMult = input(0.3, "Stop buffer, x avg candle range", min = 0.0, max = 3.0)
+zonePct = input(0.8, "Target zone fraction", min = 0.5, max = 0.99)
+maxTrades = input(3, "Max trades per day", min = 1, max = 10)
+cooloffMin = input(30, "Wait after a stop, minutes", min = 0, max = 240)
+window = "0945-1430"
+lot1Pct = 0.80
+exitRev = input(true, "Sell on a reversal candle in the zone")
+hamWick = input(0.60, "Hammer wick, min fraction", min = 0.3, max = 0.95)
+hamBody = input(0.30, "Hammer body, max fraction", min = 0.05, max = 0.6)
+dojiBody = input(0.10, "Doji body, max fraction", min = 0.01, max = 0.3)
+revBody = input(0.50, "Strong reversal body, min fraction", min = 0.2, max = 0.95)
+showSwings = input(true, "Show the 4 swings each channel is built from")
+buildTri = input(true, "Build triangles (lines sloping opposite ways, narrowing)")
+flatTol = input(0.15, "Flat line tolerance, share of width", min = 0.0, max = 0.5)
+maxSpan     = input(30, "Max pivot span, 15m bars (0 = no limit)", min = 0, max = 500)
+maxGrowth   = input(4,  "Max width growth, x lock width (0 = off)", min = 0, max = 20)
+touchTOmult = input(3,  "Touch timeout, x pivot span (0 = off)",    min = 0, max = 10)
+
+study("Nifty Anchored Channel", overlay = true, precision = 2)
+
+// ---- closed 15m bars; on the 5m bar that completes one, read it in full ----
+closes15 = (date.minute(time) + chart.intervalMinutes) % 15 == 0
+o15c = req.timeframe("15", open)
+h15c = req.timeframe("15", high)
+l15c = req.timeframe("15", low)
+c15c = req.timeframe("15", close)
+t15c = req.timeframe("15", time)
+i15c = req.timeframe("15", bar.index)
+phc = req.timeframe("15", pivotHigh(high, pivLeft, 3))
+plc = req.timeframe("15", pivotLow(low, pivLeft, 3))
+o15d = req.timeframe("15", open, "developing")
+h15d = req.timeframe("15", high, "developing")
+l15d = req.timeframe("15", low, "developing")
+c15d = req.timeframe("15", close, "developing")
+t15d = req.timeframe("15", time, "developing")
+i15d = req.timeframe("15", bar.index, "developing")
+phd = req.timeframe("15", pivotHigh(high, pivLeft, 3), "developing")
+pld = req.timeframe("15", pivotLow(low, pivLeft, 3), "developing")
+
+o15 = closes15 ? o15d : o15c
+h15 = closes15 ? h15d : h15c
+l15 = closes15 ? l15d : l15c
+c15 = closes15 ? c15d : c15c
+t15 = closes15 ? t15d : t15c
+i15 = closes15 ? i15d : i15c
+ph = closes15 ? phd : phc
+pl = closes15 ? pld : plc
+
+avgRange = sma(high - low, 21)
+
+// first 5m bar of each 15m bar, so a 15m bar has a position in 5m bars
+var starts: array<number> = []
+var base15 = none
+if isNone(base15) and not isNone(i15d)
+    base15 = i15d
+if not isNone(i15d) and (isNone(i15d[1]) or i15d != i15d[1])
+    while size(starts) < i15d - base15
+        push(starts, bar.index)
+    push(starts, bar.index)
+
+fn xOf(k) => element(starts, k - base15) + 1
+
+// per closed 15m bar, for the lowest low / highest high between two swings
+var lows15: array<number> = []
+var highs15: array<number> = []
+var times15: array<number> = []
+
+// ---- channel state ----
+var hN = 0
+var hk1 = none
+var hp1 = none
+var hk2 = none
+var hp2 = none
+var lN = 0
+var lk1 = none
+var lp1 = none
+var lk2 = none
+var lp2 = none
+var reset = -1
+var active = false
+var chanId = -1
+var lockI15 = none
+var rX = none
+var rY = none
+var rS = none
+var sX = none
+var sY = none
+var sS = none
+var prevO = none
+var prevH = none
+var prevL = none
+var prevC = none
+var lastI15 = none
+var nChannels = 0
+var patName = ""
+var lockW = 0.0
+var lastTouchI15 = 0
+var lockedPivSpan = 0
+var swingLines: array<line> = []
+var swingLabels: array<label> = []
+
+broke = false
+newChannel = false
+
+if not isNone(i15) and not isNone(base15) and i15 >= base15 and (isNone(lastI15) or i15 != lastI15)
+    lastI15 = i15
+    while size(lows15) < i15 - base15
+        push(lows15, none)
+        push(highs15, none)
+        push(times15, none)
+    push(lows15, l15)
+    push(highs15, h15)
+    push(times15, t15)
+    x15 = xOf(i15)
+
+    // a swing at bar k is known only once `right` later 15m bars have closed
+    k = i15 - pivRight
+    if k >= base15 and k > reset
+        if not isNone(ph)
+            if hN == 2
+                hk1 = hk2
+                hp1 = hp2
+            hN = min(hN + 1, 2)
+            if hN == 1
+                hk1 = k
+                hp1 = ph
+            else
+                hk2 = k
+                hp2 = ph
+        if not isNone(pl)
+            if lN == 2
+                lk1 = lk2
+                lp1 = lp2
+            lN = min(lN + 1, 2)
+            if lN == 1
+                lk1 = k
+                lp1 = pl
+            else
+                lk2 = k
+                lp2 = pl
+
+    if active
+        sNow = sY + sS * (x15 - sX)
+        rNow = rY + rS * (x15 - rX)
+        ttBand = 0.05 * (rNow - sNow)
+        if high >= rNow - ttBand or low <= sNow + ttBand
+            lastTouchI15 = i15
+        if rNow - sNow < minWidth * avgRange
+            broke = true
+        else if maxGrowth > 0 and lockW > 0 and rNow - sNow > maxGrowth * lockW
+            broke = true
+        else if i15 - 1 > lockI15 and not isNone(prevC)
+            xA = xOf(i15 - 1)
+            sA = sY + sS * (xA - sX)
+            rA = rY + rS * (xA - rX)
+            rngA = prevH - prevL
+            bodyA = rngA > 0.01 ? (prevC - prevO) / rngA : 0.0
+            up = prevC > rA and bodyA >= breakBody and o15 > rNow and c15 > rNow
+            dn = prevC < sA and -bodyA >= breakBody and o15 < sNow and c15 < sNow
+            broke = up or dn
+        if not broke and touchTOmult > 0 and lockedPivSpan > 0
+            if i15 - lastTouchI15 > touchTOmult * lockedPivSpan
+                broke = true
+        if broke
+            active = false
+            reset = i15
+            hN = 0
+            lN = 0
+            lockW = 0.0
+            lastTouchI15 = 0
+            lockedPivSpan = 0
+
+    if not active and hN == 2 and lN == 2
+        xh1 = xOf(hk1)
+        xh2 = xOf(hk2)
+        xl1 = xOf(lk1)
+        xl2 = xOf(lk2)
+        slH = (hp2 - hp1) / max(xh2 - xh1, 1)
+        slL = (lp2 - lp1) / max(xl2 - xl1, 1)
+        opp = slH * slL < 0
+        pivSpan = max(hk1, max(hk2, max(lk1, lk2))) - min(hk1, min(hk2, min(lk1, lk2)))
+        ok = (not opp or buildTri) and (maxSpan == 0 or pivSpan <= maxSpan)
+        nName = ""
+        nrX = xh1
+        nrY = hp1
+        nrS = slH
+        nsX = xl1
+        nsY = lp1
+        nsS = slL
+        if ok
+            xa = min(xh1, xl1)
+            xb = max(xh2, xl2)
+            wa = (nrY + nrS * (xa - nrX)) - (nsY + nsS * (xa - nsX))
+            wb = (nrY + nrS * (xb - nrX)) - (nsY + nsS * (xb - nsX))
+            ok = wa > 0 and wb > 0
+            if ok
+                // name the shape (Bulkowski's terms); a widening triangle (megaphone) is not built
+                span = xb - xa
+                avgW = (wa + wb) / 2
+                flatH = abs(slH) * span <= flatTol * avgW
+                flatL = abs(slL) * span <= flatTol * avgW
+                upward = slH + slL >= 0
+                narrowing = wb < wa
+                if abs(wb - wa) / max(wa, wb) <= parTol
+                    nName = flatH and flatL ? "Channel flat" : upward ? "Channel up" : "Channel down"
+                else if narrowing and flatH and not flatL and slL > 0
+                    nName = "Ascending triangle"
+                else if narrowing and flatL and not flatH and slH < 0
+                    nName = "Descending triangle"
+                else if opp
+                    nName = narrowing ? "Symmetric triangle" : "Broadening triangle"
+                else if narrowing
+                    nName = upward ? "Rising wedge" : "Falling wedge"
+                else
+                    nName = upward ? "Rising broadening wedge" : "Falling broadening wedge"
+                ok = nName != "Broadening triangle"
+            if ok and abs(wb - wa) / max(wa, wb) <= parTol
+                if (slH + slL) / 2 < 0
+                    best = hk1
+                    for q = hk1 to hk2
+                        if element(lows15, q - base15) < element(lows15, best - base15)
+                            best = q
+                    nsX = xOf(best)
+                    nsY = element(lows15, best - base15)
+                    nsS = slH
+                else
+                    best = lk1
+                    for q = lk1 to lk2
+                        if element(highs15, q - base15) > element(highs15, best - base15)
+                            best = q
+                    nrX = xOf(best)
+                    nrY = element(highs15, best - base15)
+                    nrS = slL
+        if ok
+            wNow = (nrY + nrS * (x15 - nrX)) - (nsY + nsS * (x15 - nsX))
+            ok = wNow >= minWidth * avgRange
+        if ok
+            active = true
+            newChannel = true
+            chanId = chanId + 1
+            nChannels = nChannels + 1
+            lockI15 = i15
+            lockW = (nrY + nrS * (x15 - nrX)) - (nsY + nsS * (x15 - nsX))
+            lastTouchI15 = i15
+            lockedPivSpan = pivSpan
+            patName = nName
+            rX = nrX
+            rY = nrY
+            rS = nrS
+            sX = nsX
+            sY = nsY
+            sS = nsS
+        else
+            // drop the oldest of the four swings and wait for the next one
+            if hk1 < lk1
+                hk1 = hk2
+                hp1 = hp2
+                hN = 1
+            else
+                lk1 = lk2
+                lp1 = lp2
+                lN = 1
+
+    prevO = o15
+    prevH = h15
+    prevL = l15
+    prevC = c15
+
+// ---- the active channel on this 5m bar, as straight lines ----
+cid = active ? chanId : -1
+aSup = active ? sY + sS * (bar.index - sX) : none
+aRes = active ? rY + rS * (bar.index - rX) : none
+
+resLine = plot(aRes, "Resistance", #ef4444, width = 2)
+supLine = plot(aSup, "Support", #22c55e, width = 2)
+plot(active ? (aSup + aRes) / 2 : none, "Centre", #64748b)
+fill(resLine, supLine, #64748b, opacity = 0.06)
+
+// the four swings and the lines leading from them into the channel
+if newChannel and showSwings
+    tH1 = element(times15, hk1 - base15)
+    tH2 = element(times15, hk2 - base15)
+    tL1 = element(times15, lk1 - base15)
+    tL2 = element(times15, lk2 - base15)
+    tFrom = min(tH1, tL1)
+    xFrom = min(xOf(hk1), xOf(lk1))
+    push(swingLines, draw.line(tFrom, rY + rS * (xFrom - rX), time, aRes, color = #ef4444, width = 1))
+    push(swingLines, draw.line(tFrom, sY + sS * (xFrom - sX), time, aSup, color = #22c55e, width = 1))
+    push(swingLabels, draw.label(tH1, hp1, "H1", textColor = #ef4444))
+    push(swingLabels, draw.label(tH2, hp2, "H2", textColor = #ef4444))
+    push(swingLabels, draw.label(tL1, lp1, "L1", textColor = #22c55e))
+    push(swingLabels, draw.label(tL2, lp2, "L2", textColor = #22c55e))
+    while size(swingLines) > 60
+        draw.delete(shift(swingLines))
+    while size(swingLabels) > 120
+        draw.delete(shift(swingLabels))
+
+// ---- position state, the same order of checks as the backtest ----
+buf = max(stopFixed, stopMult * orElse(avgRange, 0))
+hhmm = date.hour(time) * 100 + date.minute(time)
+entryOpen = session.isIn(window)
+
+var held = 0
+var entryPx = none
+var stopPx = none
+var lots = 0
+var lot1Done = false
+var trail = none
+var sw1 = none
+var sw2 = none
+var swN = 0
+var tradePts = 0.0
+var dayTrades = 0
+var cooloffUntil = 0
+var nTrades = 0
+var nWins = 0
+var totalPts = 0.0
+var tCid = -1
+var tRX = none
+var tRY = none
+var tRS = none
+var tSX = none
+var tSY = none
+var tSS = none
+var initStop = none
+var zoneHit = false
+var lastGreenO = none
+var lastRedO = none
+var ceN = 0
+var peN = 0
+var tNum = 0
+var tIsCE = true
+
+if newChannel
+    ceN = 0
+    peN = 0
+
+// every exit on this bar belongs to the trade held when the bar opened
+curName = held != 0 ? (tIsCE ? "CE" : "PE") + text(tNum) : none
+
+rngR = high - low
+okR = rngR >= 0.01
+bodyR = okR ? abs(close - open) / rngR : 1.0
+topWick = okR ? (high - max(open, close)) / rngR : 0.0
+botWick = okR ? (min(open, close) - low) / rngR : 0.0
+isDoji = okR and bodyR <= dojiBody
+topRev = okR and (isDoji or (topWick >= hamWick and bodyR <= hamBody) or (close < open and bodyR >= revBody and not isNone(lastGreenO) and close < lastGreenO))
+botRev = okR and (isDoji or (botWick >= hamWick and bodyR <= hamBody) or (close > open and bodyR >= revBody and not isNone(lastRedO) and close > lastRedO))
+
+ceEntry = false
+peEntry = false
+exitStop = false
+exitTrail = false
+exitTarget = false
+exitEod = false
+exitLot1 = false
+exitPx = none
+closed = false
+booked = false
+
+if session.isFirstBar
+    dayTrades = 0
+    held = 0
+
+// a held trade keeps the channel it was entered on, even after a break
+useTrade = held != 0 and cid != tCid
+support = useTrade ? tSY + tSS * (bar.index - tSX) : aSup
+resistance = useTrade ? tRY + tRS * (bar.index - tRX) : aRes
+centre = (support + resistance) / 2
+width = resistance - support
+chanOk = not isNone(support) and not isNone(resistance) and not isNone(i15)
+
+if held != 0 and hhmm >= 1515
+    exitEod = true
+    exitPx = close
+    closed = true
+else if held != 0 or entryOpen
+    if held == 1
+        if close < stopPx
+            exitTrail = stopPx != initStop
+            exitStop = not exitTrail
+            exitPx = close
+            closed = true
+        else
+            if close > open
+                sw1 = sw2
+                sw2 = low
+                swN = swN + 1
+            if swN >= 2
+                t = min(sw1, sw2) - buf
+                trail = isNone(trail) ? t : max(trail, t)
+                stopPx = max(stopPx, trail)
+    else if held == -1
+        if close > stopPx
+            exitTrail = stopPx != initStop
+            exitStop = not exitTrail
+            exitPx = close
+            closed = true
+        else
+            if close < open
+                sw1 = sw2
+                sw2 = high
+                swN = swN + 1
+            if swN >= 2
+                t = max(sw1, sw2) + buf
+                trail = isNone(trail) ? t : min(trail, t)
+                stopPx = min(stopPx, trail)
+
+    if not closed and chanOk
+        if held == 1
+            if close >= centre and stopPx < entryPx
+                stopPx = entryPx
+            if not lot1Done and lots >= 2 and close >= support + lot1Pct * width
+                exitLot1 = true
+                tradePts = tradePts + (close - entryPx)
+                lots = lots - 1
+                lot1Done = true
+            tgtLvl = support + zonePct * width
+            if exitRev
+                if high >= tgtLvl and topRev
+                    exitTarget = true
+                    exitPx = close
+                    closed = true
+                else
+                    zoneHit = zoneHit or high >= tgtLvl
+                    if zoneHit and close > open
+                        stopPx = max(stopPx, (open + close) / 2)
+            else if close >= tgtLvl and close < open
+                exitTarget = true
+                exitPx = close
+                closed = true
+        else if held == -1
+            if close <= centre and stopPx > entryPx
+                stopPx = entryPx
+            if not lot1Done and lots >= 2 and close <= resistance - lot1Pct * width
+                exitLot1 = true
+                tradePts = tradePts + (entryPx - close)
+                lots = lots - 1
+                lot1Done = true
+            tgtLvl = resistance - zonePct * width
+            if exitRev
+                if low <= tgtLvl and botRev
+                    exitTarget = true
+                    exitPx = close
+                    closed = true
+                else
+                    zoneHit = zoneHit or low <= tgtLvl
+                    if zoneHit and close < open
+                        stopPx = min(stopPx, (open + close) / 2)
+            else if close <= tgtLvl and close > open
+                exitTarget = true
+                exitPx = close
+                closed = true
+
+        if exitTarget
+            tradePts = tradePts + held * (exitPx - entryPx) * lots
+            nTrades = nTrades + 1
+            nWins = nWins + (tradePts > 0 ? 1 : 0)
+            totalPts = totalPts + tradePts
+            held = 0
+            booked = true
+
+        // entry: candle 1 (previous bar) rejects at the line, candle 2 (this bar) closes beyond it
+        if held == 0 and entryOpen and dayTrades < maxTrades and time >= cooloffUntil
+            prevOk = cid >= 0 and cid[1] == cid and not isNone(aSup[1])
+            if prevOk
+                s1 = aSup[1]
+                r1 = aRes[1]
+                band = touchFrac * (r1 - s1)
+                rng1 = high[1] - low[1]
+                b1 = rng1 > 0.01 ? (close[1] - open[1]) / rng1 : 0.0
+                ceOk = low[1] <= s1 + band and close[1] >= s1 and b1 >= bodyMin and close > high[1]
+                peOk = high[1] >= r1 - band and close[1] <= r1 and -b1 >= bodyMin and close < low[1]
+                if ceOk
+                    sp = min(support, min(low, low[1])) - buf
+                    if close - sp > 0 and resistance - close >= rrMin * (close - sp)
+                        ceEntry = true
+                        held = 1
+                        stopPx = sp
+                else if peOk
+                    sp = max(resistance, max(high, high[1])) + buf
+                    if sp - close > 0 and close - support >= rrMin * (sp - close)
+                        peEntry = true
+                        held = -1
+                        stopPx = sp
+            if held != 0
+                tIsCE = held == 1
+                ceN = ceN + (tIsCE ? 1 : 0)
+                peN = peN + (tIsCE ? 0 : 1)
+                tNum = tIsCE ? ceN : peN
+                initStop = stopPx
+                zoneHit = false
+                entryPx = close
+                lots = 2
+                lot1Done = false
+                trail = none
+                swN = 0
+                tradePts = 0.0
+                dayTrades = dayTrades + 1
+                tCid = cid
+                tRX = rX
+                tRY = rY
+                tRS = rS
+                tSX = sX
+                tSY = sY
+                tSS = sS
+
+if closed and not booked
+    tradePts = tradePts + held * (exitPx - entryPx) * lots
+    nTrades = nTrades + 1
+    nWins = nWins + (tradePts > 0 ? 1 : 0)
+    totalPts = totalPts + tradePts
+    if exitStop or exitTrail
+        cooloffUntil = time + cooloffMin * 60000
+    held = 0
+
+// ---- markers ----
+signal(ceEntry ? "CE" + text(tNum) + " Buy" : none, color = #22c55e, at = "below", shape = "triangleUp")
+signal(peEntry ? "PE" + text(tNum) + " Buy" : none, color = #ef4444, at = "above", shape = "triangleDown")
+signal(exitLot1 ? curName + " Lot 1" : none, color = #94a3b8, at = "above", shape = "circle")
+signal(exitTarget ? curName + " Sell" : none, color = #84cc16, at = "above", shape = "diamond")
+signal(exitStop ? curName + " Stop" : none, color = #f97316, at = "above", shape = "cross")
+signal(exitTrail ? curName + " Trail" : none, color = #eab308, at = "above", shape = "cross")
+signal(exitEod ? curName + " 15:15" : none, color = #a78bfa, at = "above", shape = "square")
+signal(broke ? "Break" : none, color = #64748b, at = "below", shape = "flag")
+signal(newChannel ? patName : none, color = #94a3b8, at = "below", shape = "label")
+
+plot(held != 0 ? stopPx : none, "Stop", #f97316, style = "step")
+plot(held != 0 ? entryPx : none, "Entry", #e5e7eb, style = "step")
+targetLvl = held == 1 ? support + zonePct * width : held == -1 ? resistance - zonePct * width : none
+plot(targetLvl, "Target zone", #84cc16, style = "step")
+
+// ---- tally on the loaded bars, in Nifty points (2 lots, before costs) ----
+stats = table("Tally", 5, 2, position = "topRight")
+if bar.isLast
+    cell(stats, 0, 0, "Channels")
+    cell(stats, 0, 1, text(nChannels))
+    cell(stats, 1, 0, "Trades")
+    cell(stats, 1, 1, text(nTrades))
+    cell(stats, 2, 0, "Win rate")
+    cell(stats, 2, 1, nTrades > 0 ? text(100 * nWins / nTrades, 1) + "%" : "-")
+    cell(stats, 3, 0, "Nifty pts")
+    cell(stats, 3, 1, text(totalPts, 1))
+    cell(stats, 4, 0, "Chart")
+    cell(stats, 4, 1, chart.intervalMinutes == 5 ? "5m, as tested" : "Switch to 5m: tested on 5m")
+
+// opens of the latest green and red candles, for the next bar's reversal check
+if close > open
+    lastGreenO = open
+if close < open
+    lastRedO = open
